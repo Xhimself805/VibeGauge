@@ -1,0 +1,19 @@
+# PlatformIO build output / downloaded packages
+firmware/.pio/
+.pio/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Logs / local
+*.log
