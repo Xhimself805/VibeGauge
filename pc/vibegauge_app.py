@@ -60,9 +60,6 @@ def read_token():
     token = oauth.get("accessToken")
     if not token:
         raise RuntimeError("No claudeAiOauth.accessToken in credentials.")
-    expires = oauth.get("expiresAt")
-    if isinstance(expires, (int, float)) and expires / 1000 < time.time():
-        raise RuntimeError("OAuth token expired — run any Claude Code command to refresh.")
     return token
 
 
@@ -358,13 +355,7 @@ class VibeGaugeApp:
     # ── background serial/fetch loop ──────────────────────────────────────────
 
     def _run_loop(self):
-        try:
-            version = detect_cc_version()
-            token   = read_token()
-        except Exception as e:
-            self._status = f"Auth error: {e}"
-            return
-
+        version          = detect_cc_version()
         fetch_interval   = max(MIN_FETCH_INTERVAL, self.cfg.get("fetch_interval", 300))
         display_interval = self.cfg.get("display_interval", 20)
         last_fetch = 0.0
@@ -386,6 +377,7 @@ class VibeGaugeApp:
             mono = time.monotonic()
             if last_fetch == 0 or (mono - last_fetch) >= fetch_interval:
                 try:
+                    token = read_token()  # re-read each time; picks up Claude Code token refreshes
                     data = fetch_usage(token, version)
                     with self._usage_lock:
                         self._usage = data
@@ -394,8 +386,9 @@ class VibeGaugeApp:
                 except urllib.error.HTTPError as e:
                     if e.code == 429:
                         self._status = "429 rate-limited; using last value"
+                        last_fetch = mono  # back off; don't retry every 20s
                     elif e.code == 401:
-                        self._status = "401 token expired — run Claude Code to refresh"
+                        self._status = "401 unauthorized — run Claude Code to refresh token"
                     else:
                         self._status = f"HTTP {e.code}"
                 except urllib.error.URLError as e:
