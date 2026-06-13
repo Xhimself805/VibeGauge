@@ -1,19 +1,22 @@
 /*
- * Claude Max-plan usage display
- * STM32F103 "Blue Pill" + 0.96" SSD1306 128x64 I2C OLED.
+ * VibeGauge firmware — STM32F103 "Blue Pill" + 0.96" SSD1306 128x64 I2C OLED.
  *
- * The PC (pc/claude_usage.py) does all the work and sends one newline-
- * terminated line per update over USART1:
+ * Protocol (from pc/vibegauge_app.py, one packet per update, newline-terminated):
  *
- *     <textline1>|<textline2>|...|<barPercent>\n
+ *     fh_pct|fh_reset|wk_pct|wk_reset|HH:MM\n
  *
- * Every '|'-separated field except the LAST is drawn as a text row (top to
- * bottom); the last field is an integer 0-100 rendered as a progress bar.
- * This keeps the firmware dumb: change what's shown by editing Python only.
+ *   fh_pct   – 5-hour utilisation 0-100 (integer)
+ *   fh_reset – time until 5-hour window resets, e.g. "3h05m"
+ *   wk_pct   – 7-day utilisation 0-100 (integer)
+ *   wk_reset – time until 7-day window resets, e.g. "9h45m"
+ *   HH:MM    – wall-clock time from the PC
  *
- * On boot it ALSO scans the I2C bus and reports over USART1 (115200), and
- * auto-detects the SSD1306 at 0x3C or 0x3D. Open a serial reader on the same
- * port to see the scan -- this is how we diagnose a blank screen.
+ * Display layout (128x64, u8g2_font_6x12_tr):
+ *
+ *   y=10   "23:14  5s ago"
+ *   y=30   "5h  26%  in 3h05m"
+ *   y=50   "Wk   3%  in 9h45m"
+ *   y=55   [progress bar, h=8]
  *
  * --- Wiring ---------------------------------------------------------------
  *  OLED (I2C1):   VCC -> 3V3      GND -> GND
@@ -29,33 +32,35 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 
-// Full-buffer hardware-I2C SSD1306. Default Wire = I2C1 (PB6/PB7) on Blue Pill.
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /*reset=*/U8X8_PIN_NONE);
 
-// USART1 on PA9/PA10 carries data from the PC (and our diagnostics out).
 HardwareSerial DataSerial(PA10, PA9);  // (RX, TX)
 
-static const uint32_t BAUD = 115200;
-static const uint32_t STALE_MS = 8000;   // show "waiting" if no packet this long
-static const uint32_t HB_MS = 2000;      // heartbeat cadence while waiting
+static const uint32_t BAUD   = 115200;
+static const uint32_t HB_MS  = 2000;
 
-static const uint8_t MAX_LINES = 5;
-static char lineBuf[160];
+static char lineBuf[128];
 static uint8_t lineLen = 0;
 
-static char textLines[MAX_LINES][32];
-static uint8_t textCount = 0;
-static int barPct = 0;
-static bool haveData = false;
+// Parsed packet fields
+static int  fhPct  = 0;
+static char fhReset[12] = "";
+static int  wkPct  = 0;
+static char wkReset[12] = "";
+static char sentTime[8]  = "";   // "HH:MM" from PC
+
+static bool     haveData    = false;
 static uint32_t lastPacketMs = 0;
-static uint32_t lastHbMs = 0;
-static uint8_t oledAddr = 0;             // 0 = not found
+static uint32_t lastHbMs    = 0;
+static uint8_t  oledAddr    = 0;
+
+// ── I2C / OLED helpers ────────────────────────────────────────────────────────
 
 static uint8_t scanForOled() {
-  const uint8_t candidates[2] = {0x3C, 0x3D};
+  const uint8_t cands[2] = {0x3C, 0x3D};
   for (uint8_t i = 0; i < 2; i++) {
-    Wire.beginTransmission(candidates[i]);
-    if (Wire.endTransmission() == 0) return candidates[i];
+    Wire.beginTransmission(cands[i]);
+    if (Wire.endTransmission() == 0) return cands[i];
   }
   return 0;
 }
@@ -72,16 +77,17 @@ static void i2cScanReport() {
       found++;
     }
   }
-  if (!found) DataSerial.print(" (no devices -> check OLED wiring/power)");
+  if (!found) DataSerial.print(" (none)");
   DataSerial.println();
 }
+
+// ── Display ───────────────────────────────────────────────────────────────────
 
 static void drawWaiting() {
   if (!oledAddr) return;
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.drawStr(8, 22, "Claude usage");
-  u8g2.drawStr(12, 40, "Waiting for PC...");
+  u8g2.drawStr(30, 35, "VibeGauge");
   u8g2.sendBuffer();
 }
 
@@ -90,15 +96,31 @@ static void drawStatus() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tr);
 
-  uint8_t rows = textCount;
-  if (rows > 4) rows = 4;
-  for (uint8_t i = 0; i < rows; i++) {
-    u8g2.drawStr(2, 11 + i * 12, textLines[i]);
-  }
+  // Row 0 (y=10): "HH:MM  Xs ago"
+  char header[28];
+  uint32_t secs = (millis() - lastPacketMs) / 1000;
+  if (secs < 60)
+    snprintf(header, sizeof(header), "%s  %ds ago", sentTime, (int)secs);
+  else if (secs < 3600)
+    snprintf(header, sizeof(header), "%s  %dm ago", sentTime, (int)(secs / 60));
+  else
+    snprintf(header, sizeof(header), "%s  %dh ago", sentTime, (int)(secs / 3600));
+  u8g2.drawStr(2, 10, header);
 
-  const int bx = 2, by = 54, bw = 124, bh = 9;
+  // Row 1 (y=30): "5h  26%  in 3h05m"
+  char line1[32];
+  snprintf(line1, sizeof(line1), "5h %3d%%  in %s", fhPct, fhReset);
+  u8g2.drawStr(2, 30, line1);
+
+  // Row 2 (y=50): "Wk   3%  in 9h45m"
+  char line2[32];
+  snprintf(line2, sizeof(line2), "Wk %3d%%  in %s", wkPct, wkReset);
+  u8g2.drawStr(2, 50, line2);
+
+  // Progress bar (5h usage), y=55 h=8
+  const int bx = 2, by = 55, bw = 124, bh = 8;
   u8g2.drawFrame(bx, by, bw, bh);
-  int fill = (barPct * (bw - 2)) / 100;
+  int fill = (fhPct * (bw - 2)) / 100;
   if (fill < 0) fill = 0;
   if (fill > bw - 2) fill = bw - 2;
   if (fill > 0) u8g2.drawBox(bx + 1, by + 1, fill, bh - 2);
@@ -106,61 +128,53 @@ static void drawStatus() {
   u8g2.sendBuffer();
 }
 
-static void parsePacket(char *buf) {
-  textCount = 0;
-  barPct = 0;
+// ── Packet parser ─────────────────────────────────────────────────────────────
 
-  char *fields[MAX_LINES + 2];
+static void parsePacket(char *buf) {
+  // Expected: fh_pct|fh_reset|wk_pct|wk_reset|HH:MM
+  char *f[6];
   uint8_t n = 0;
   char *p = buf;
-  fields[n++] = p;
-  while (*p && n < (uint8_t)(MAX_LINES + 2)) {
-    if (*p == '|') {
-      *p = '\0';
-      fields[n++] = p + 1;
-    }
+  f[n++] = p;
+  while (*p && n < 6) {
+    if (*p == '|') { *p = '\0'; f[n++] = p + 1; }
     p++;
   }
-  if (n == 0) return;
+  if (n < 5) return;
 
-  barPct = atoi(fields[n - 1]);
+  fhPct = atoi(f[0]);
+  strncpy(fhReset,  f[1], sizeof(fhReset)  - 1); fhReset[sizeof(fhReset)   - 1] = '\0';
+  wkPct = atoi(f[2]);
+  strncpy(wkReset,  f[3], sizeof(wkReset)  - 1); wkReset[sizeof(wkReset)   - 1] = '\0';
+  strncpy(sentTime, f[4], sizeof(sentTime) - 1); sentTime[sizeof(sentTime) - 1] = '\0';
 
-  uint8_t rows = n - 1;
-  if (rows > MAX_LINES) rows = MAX_LINES;
-  for (uint8_t i = 0; i < rows; i++) {
-    strncpy(textLines[i], fields[i], sizeof(textLines[i]) - 1);
-    textLines[i][sizeof(textLines[i]) - 1] = '\0';
-  }
-  textCount = rows;
-
-  haveData = true;
+  haveData    = true;
   lastPacketMs = millis();
 }
+
+// ── Arduino entry points ──────────────────────────────────────────────────────
 
 void setup() {
   DataSerial.begin(BAUD);
   delay(50);
   DataSerial.println();
-  DataSerial.println("=== Claude OLED firmware booted ===");
+  DataSerial.println("=== VibeGauge firmware booted ===");
 
-  // Explicit I2C1 pins, then scan + auto-detect the panel.
   Wire.setSCL(PB6);
   Wire.setSDA(PB7);
   Wire.begin();
   Wire.setClock(400000);
   i2cScanReport();
   oledAddr = scanForOled();
-  DataSerial.print("OLED detected at: ");
+  DataSerial.print("OLED at: ");
   if (oledAddr) {
-    DataSerial.print("0x");
-    DataSerial.println(oledAddr, HEX);
-    u8g2.setI2CAddress(oledAddr << 1);   // U8g2 wants the 8-bit address
+    DataSerial.print("0x"); DataSerial.println(oledAddr, HEX);
+    u8g2.setI2CAddress(oledAddr << 1);
     u8g2.begin();
     u8g2.setBusClock(400000);
     drawWaiting();
-    DataSerial.println("Display initialised. Waiting for PC data...");
   } else {
-    DataSerial.println("NONE (no SSD1306 on the bus)");
+    DataSerial.println("none");
   }
 }
 
@@ -179,12 +193,11 @@ void loop() {
     }
   }
 
-  uint32_t now = millis();
-  if (haveData && (now - lastPacketMs) < STALE_MS) {
+  if (haveData) {
     drawStatus();
   } else {
     drawWaiting();
-    // Heartbeat over serial so we can confirm the chip is alive while idle.
+    uint32_t now = millis();
     if (now - lastHbMs >= HB_MS) {
       lastHbMs = now;
       DataSerial.print("[hb] alive, oled=");
